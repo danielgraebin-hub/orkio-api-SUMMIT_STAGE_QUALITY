@@ -23,12 +23,27 @@ def normalize_language_profile(value: str | None) -> str:
     return raw if raw in _ALLOWED_LANGUAGES else "pt-BR"
 
 
-def get_summit_runtime_config(*, mode: str | None = None, response_profile: str | None = None, language_profile: str | None = None) -> Dict[str, Any]:
+def resolve_realtime_transcription_language(language_profile: str | None) -> str | None:
+    language = normalize_language_profile(language_profile)
+
+    if language == "auto":
+        return None
+    if language == "pt-BR":
+        return "pt"
+    return language
+
+
+def get_summit_runtime_config(
+    *,
+    mode: str | None = None,
+    response_profile: str | None = None,
+    language_profile: str | None = None,
+) -> Dict[str, Any]:
     runtime_mode = normalize_mode(mode)
     profile = normalize_response_profile(response_profile)
     language = normalize_language_profile(language_profile)
 
-    transcription_language = None if language == "auto" else language
+    transcription_language = resolve_realtime_transcription_language(language)
     short_answers = runtime_mode == "summit" and profile == "stage"
 
     return {
