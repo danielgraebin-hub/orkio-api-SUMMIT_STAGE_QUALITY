@@ -4769,7 +4769,7 @@ def realtime_get_session(
             "content": ev.content,
             "transcript_punct": getattr(ev, "transcript_punct", None),
             "created_at": ev.created_at,
-            "is_final": bool(ev.is_final),
+            "is_final": bool(getattr(ev, "is_final", False)),
             "meta": ev.meta,
         }
 
