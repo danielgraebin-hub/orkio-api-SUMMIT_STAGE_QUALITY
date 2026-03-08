@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 import os
+
+# ===============================
+# REALTIME VAD CONFIG
+# ===============================
+REALTIME_VAD_THRESHOLD = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.85"))
+REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1200"))
+REALTIME_VAD_PREFIX_PADDING_MS = int(os.getenv("REALTIME_VAD_PREFIX_PADDING_MS", "300"))
+
 import logging
 import hashlib
 import json, time, uuid, re
@@ -4335,7 +4343,13 @@ async def realtime_client_secret(
             "output": {"voice": voice},
             # Let the server detect turns for lowest-latency voice UX
             "input": {
-                "turn_detection": {"type": "server_vad", "create_response": True},
+                "turn_detection": {
+        "type": "server_vad",
+        "threshold": REALTIME_VAD_THRESHOLD,
+        "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
+        "prefix_padding_ms": REALTIME_VAD_PREFIX_PADDING_MS,
+        "create_response": True
+    },
                 # Optional transcription for UI captions / logs
                 "transcription": {
                     **({"language": resolved_language} if resolved_language else {}),
