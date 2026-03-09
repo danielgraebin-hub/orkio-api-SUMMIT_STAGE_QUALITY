@@ -44,6 +44,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import urllib.request as _urllib_request
 import ssl as _ssl
+from typing import Optional
+from fastapi import Header
 
 
 # Email via Resend (preferred). If RESEND_API_KEY is missing, email sending is skipped.
@@ -101,6 +103,12 @@ _CHAT_MAX_PER_MINUTE = int(os.getenv("CHAT_MAX_PER_MINUTE", "30"))
 
 _rl_realtime_lock = _threading.Lock()
 _rl_realtime_calls: dict = {}  # {user_id: [ts...]}
+
+# Founder handoff dedicated rate limit
+_handoff_rl_lock = _threading.Lock()
+_handoff_rl_calls: dict = {}  # {key: [ts...]}
+_FOUNDER_HANDOFF_MAX_PER_10M = int(os.getenv("FOUNDER_HANDOFF_MAX_PER_10M", "3"))
+
 _REALTIME_MAX_PER_MINUTE = int(os.getenv("REALTIME_MAX_PER_MINUTE", "30"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 
@@ -339,12 +347,33 @@ def admin_emails() -> List[str]:
         return []
     return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
+
+def _summit_mode_enabled() -> bool:
+    return os.getenv("SUMMIT_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def resolve_stt_language(preferred: Optional[str] = None) -> Optional[str]:
-    """Resolve transcription language. Empty/auto => provider auto-detect."""
-    lang = (preferred or os.getenv("OPENAI_STT_LANGUAGE", "") or os.getenv("OPENAI_REALTIME_TRANSCRIBE_LANGUAGE", "")).strip()
-    if lang.lower() == "auto":
+    """Resolve transcription language.
+    Priority:
+      1) explicit preferred language
+      2) SUMMIT_STT_LANGUAGE (event-specific)
+      3) OPENAI_STT_LANGUAGE / OPENAI_REALTIME_TRANSCRIBE_LANGUAGE
+      4) pt-BR only when SUMMIT_MODE is enabled
+      5) provider auto-detect otherwise
+    Empty/auto => provider auto-detect.
+    """
+    candidates = [
+        preferred,
+        os.getenv("SUMMIT_STT_LANGUAGE", ""),
+        os.getenv("OPENAI_STT_LANGUAGE", ""),
+        os.getenv("OPENAI_REALTIME_TRANSCRIBE_LANGUAGE", ""),
+    ]
+    lang = next(((c or "").strip() for c in candidates if (c or "").strip()), "")
+    if not lang and _summit_mode_enabled():
+        lang = "pt-BR"
+    if lang.lower() in ("", "auto"):
         return None
-    return lang or None
+    return lang
 
 def _ensure_admin_user_state(u: Optional[User]) -> bool:
     """Best-effort structural admin promotion for configured emails."""
@@ -650,6 +679,22 @@ class ContactIn(BaseModel):
     consent_terms: bool = True
     consent_marketing: bool = False
     terms_version: str = TERMS_VERSION
+
+
+
+class FounderHandoffIn(BaseModel):
+    thread_id: Optional[str] = None
+    interest_type: str = Field(default="general", min_length=2, max_length=50)
+    message: str = Field(min_length=3, max_length=2000)
+    source: str = Field(default="app_console", min_length=2, max_length=50)
+    consent_contact: bool = Field(default=True)
+
+
+class FounderHandoffOut(BaseModel):
+    ok: bool = True
+    code: str = "FOUNDER_HANDOFF_CREATED"
+    contact_request_id: str
+    thread_id: Optional[str] = None
 
 class SignupCodeIn(BaseModel):
     label: str = Field(min_length=1, max_length=100)
@@ -3712,10 +3757,7 @@ async def chat_stream(
     if not message:
         raise HTTPException(400, "message required")
 
-    tenant = (inp.tenant or org or "").strip() or org
-    if tenant != org:
-        # Guard: tenant from payload must not override JWT tenant
-        tenant = org
+    tenant = org
 
     agent_id = inp.agent_id
     top_k = int(inp.top_k or 6)
@@ -5162,6 +5204,119 @@ def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = De
         pass
 
     return {"access_token": token, "token_type": "bearer", "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier}}
+
+
+
+
+@app.post("/api/founder/handoff", response_model=FounderHandoffOut)
+def founder_handoff(
+    inp: FounderHandoffIn,
+    request: Request,
+    x_org_slug: Optional[str] = Header(default=None),
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    org = _resolve_org(user, x_org_slug)
+    user_id = (user.get("sub") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not inp.consent_contact:
+        raise HTTPException(status_code=400, detail={"code": "FOUNDER_HANDOFF_CONSENT_REQUIRED", "message": "Consentimento é obrigatório para acionar Daniel."})
+
+    ip = (request.client.host if request and request.client else "unknown")
+    rate_keys = [
+        f"user:{user_id}",
+        f"ip:{ip}",
+        f"thread:{inp.thread_id.strip()}" if inp.thread_id else None,
+    ]
+    for key in [k for k in rate_keys if k]:
+        if not _rate_limit_check(_handoff_rl_lock, _handoff_rl_calls, key, _FOUNDER_HANDOFF_MAX_PER_10M, window=600):
+            raise HTTPException(status_code=429, detail={"code": "FOUNDER_HANDOFF_LIMIT", "message": "Muitas solicitações de contato. Aguarde alguns minutos."})
+
+    db_user = db.execute(
+        select(User).where(
+            User.id == user_id,
+            User.org_slug == org,
+        )
+    ).scalar_one_or_none()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    thread_id = (inp.thread_id or "").strip() or None
+    if thread_id:
+        th = db.execute(
+            select(Thread).where(
+                Thread.id == thread_id,
+                Thread.org_slug == org,
+            )
+        ).scalar_one_or_none()
+        if not th:
+            raise HTTPException(status_code=404, detail={"code": "THREAD_NOT_FOUND", "message": "Thread não encontrada"})
+        _require_thread_member(db, org, thread_id, user_id)
+
+    clean_interest = (inp.interest_type or "general").strip().lower()
+    clean_source = (inp.source or "app_console").strip().lower()
+    clean_message = (inp.message or "").strip()
+    if not clean_message:
+        raise HTTPException(status_code=400, detail={"code": "FOUNDER_HANDOFF_MESSAGE_REQUIRED", "message": "Mensagem é obrigatória"})
+
+    subject_map = {
+        "investor": "Investor interest",
+        "investment": "Investor interest",
+        "sales": "Orkio SaaS interest",
+        "saas": "Orkio SaaS interest",
+        "partnership": "Partnership interest",
+        "general": "Founder handoff",
+    }
+    subject = subject_map.get(clean_interest, "Founder handoff")
+    if thread_id:
+        subject = f"{subject} · Thread {thread_id}"
+
+    cr = ContactRequest(
+        id=new_id(),
+        full_name=(db_user.name or db_user.email or "Usuário").strip(),
+        email=(db_user.email or "").strip().lower(),
+        whatsapp=None,
+        subject=subject,
+        message=clean_message,
+        privacy_request_type=None,
+        consent_terms=True,
+        consent_marketing=bool(getattr(db_user, "marketing_consent", False)),
+        ip_address=ip,
+        user_agent=(request.headers.get("user-agent", "") if request else ""),
+        terms_version=getattr(db_user, "terms_version", None) or TERMS_VERSION,
+        status="pending",
+        retention_until=now_ts() + (365 * 86400),
+        created_at=now_ts(),
+    )
+    db.add(cr)
+    db.commit()
+
+    meta = {
+        "thread_id": thread_id,
+        "interest_type": clean_interest,
+        "source": clean_source,
+        "contact_request_id": cr.id,
+        "email": db_user.email,
+    }
+    _audit(db, org, user_id, "founder.handoff_requested", meta=meta)
+
+    try:
+        body = (
+            f"Novo handoff para founder\n\n"
+            f"Nome: {db_user.name}\n"
+            f"Email: {db_user.email}\n"
+            f"Tenant: {org}\n"
+            f"Thread: {thread_id or '-'}\n"
+            f"Interesse: {clean_interest}\n"
+            f"Origem: {clean_source}\n\n"
+            f"Mensagem:\n{clean_message}\n"
+        )
+        _send_resend_email(RESEND_INTERNAL_TO, f"[ORKIO] {subject}", body)
+    except Exception:
+        logger.exception("FOUNDER_HANDOFF_NOTIFY_FAILED")
+
+    return FounderHandoffOut(contact_request_id=cr.id, thread_id=thread_id)
 
 
 # ── Contact / LGPD endpoints ──────────────────────────────────────────
