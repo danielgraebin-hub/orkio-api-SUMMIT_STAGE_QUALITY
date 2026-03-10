@@ -130,8 +130,10 @@ SUMMIT_STD_REALTIME_MAX_MIN_DAY = int(os.getenv("SUMMIT_STD_REALTIME_MAX_MIN_DAY
 # Optional OpenAI
 try:
     from openai import OpenAI
-except Exception:
+    _OPENAI_IMPORT_ERROR = None
+except Exception as e:
     OpenAI = None  # type: ignore
+    _OPENAI_IMPORT_ERROR = str(e)
 
 
 
@@ -687,6 +689,7 @@ class ChatOut(BaseModel):
     agent_id: Optional[str] = None
     agent_name: Optional[str] = None
     voice_id: Optional[str] = None
+    avatar_url: Optional[str] = None
     
 # =========================
 # Idempotency helpers
@@ -1678,18 +1681,9 @@ def _get_feature_flag(db: Session, org: str, key: str) -> Optional[str]:
             select(FeatureFlag).where(FeatureFlag.org_slug == org, FeatureFlag.flag_key == key)
         ).scalar_one_or_none()
         return ff.flag_value if ff else None
-    except Exception as e:
-        msg = str(e)
-        low = msg.lower()
-        code = None
-        if "rate" in low and "limit" in low or "429" in low:
-            code = "SERVER_BUSY"
-        elif "overload" in low or "overloaded" in low or "temporarily unavailable" in low or "server busy" in low:
-            code = "SERVER_BUSY"
-        elif "timeout" in low or "timed out" in low:
-            code = "TIMEOUT"
-        return {"code": code or "LLM_ERROR", "error": msg, "message": msg, "text": "", "usage": None, "model": model}
-
+    except Exception:
+        logger.exception("FEATURE_FLAG_READ_FAILED org=%s key=%s", org, key)
+        return None
 
 
 @app.post("/api/auth/register", response_model=TokenOut)
@@ -1979,17 +1973,57 @@ def _openai_answer(
     Returns dict:
       {text, usage, model} on success
       {code, error, message} on known failures (SERVER_BUSY, TIMEOUT, LLM_ERROR)
-      None only if OpenAI client is unavailable/misconfigured.
+      None only if an unexpected internal failure occurs before classification.
     """
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    model = (model_override or os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
-    if not key or OpenAI is None:
-        return None
+    key = _clean_env(os.getenv("OPENAI_API_KEY", ""), default="").strip()
+    model = (
+        _clean_env(model_override, default="").strip()
+        or _clean_env(os.getenv("OPENAI_MODEL", ""), default="").strip()
+        or _clean_env(os.getenv("DEFAULT_CHAT_MODEL", ""), default="").strip()
+        or "gpt-4o-mini"
+    )
+
+    if not key:
+        return {
+            "code": "LLM_ERROR",
+            "error": "missing_openai_key",
+            "message": "OPENAI_API_KEY ausente",
+            "text": "",
+            "usage": None,
+            "model": model,
+        }
+
+    if OpenAI is None:
+        return {
+            "code": "LLM_ERROR",
+            "error": "openai_client_unavailable",
+            "message": _OPENAI_IMPORT_ERROR or "biblioteca openai indisponível",
+            "text": "",
+            "usage": None,
+            "model": model,
+        }
+
     try:
-        timeout_s = float(os.getenv("OPENAI_TIMEOUT") or os.getenv("LLM_TIMEOUT") or "45")
+        timeout_s = float(
+            _clean_env(os.getenv("OPENAI_TIMEOUT", ""), default="")
+            or _clean_env(os.getenv("LLM_TIMEOUT", ""), default="")
+            or "45"
+        )
     except Exception:
         timeout_s = 45.0
-    client = OpenAI(api_key=key, timeout=timeout_s)
+
+    try:
+        client = OpenAI(api_key=key, timeout=timeout_s)
+    except Exception as e:
+        msg = str(e) or "openai_client_init_failed"
+        return {
+            "code": "LLM_ERROR",
+            "error": "openai_client_init_failed",
+            "message": msg,
+            "text": "",
+            "usage": None,
+            "model": model,
+        }
 
     # Build context string (RAG)
     ctx = ""
@@ -2043,18 +2077,44 @@ def _openai_answer(
         if temperature is not None:
             kwargs["temperature"] = temperature
         r = client.chat.completions.create(**kwargs)
-        return {"text": (r.choices[0].message.content or "").strip(), "usage": getattr(r, "usage", None), "model": model}
+
+        answer_text = ""
+        try:
+            answer_text = ((r.choices or [])[0].message.content or "").strip()
+        except Exception:
+            answer_text = ""
+
+        return {
+            "text": answer_text,
+            "usage": getattr(r, "usage", None),
+            "model": model,
+        }
     except Exception as e:
-        # Classify failures for frontend retry policy.
-        s = str(e).lower()
+        msg = str(e) or "LLM_ERROR"
+        low = msg.lower()
         code = "LLM_ERROR"
-        if "timeout" in s or "timed out" in s:
-            code = "TIMEOUT"
-        # OpenAI overload / rate limits / 429 / "server is busy"
-        if ("rate limit" in s) or ("429" in s) or ("overload" in s) or ("server is busy" in s) or ("too many requests" in s):
+
+        if (
+            "rate limit" in low
+            or "429" in low
+            or "overload" in low
+            or "overloaded" in low
+            or "server is busy" in low
+            or "too many requests" in low
+            or "quota" in low
+        ):
             code = "SERVER_BUSY"
-        msg = str(e) or code
-        return {"code": code, "error": msg, "message": msg}
+        elif "timeout" in low or "timed out" in low:
+            code = "TIMEOUT"
+
+        return {
+            "code": code,
+            "error": msg,
+            "message": msg,
+            "text": "",
+            "usage": None,
+            "model": model,
+        }
 
 
 
@@ -2355,7 +2415,15 @@ def chat(
 
         if ans_obj and ans_obj.get("code") and not answer:
             # surface structured error
-            raise HTTPException(status_code=503, detail=ans_obj.get("code") or "LLM_ERROR")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": ans_obj.get("code") or "LLM_ERROR",
+                    "error": ans_obj.get("error") or "provider_failure",
+                    "message": ans_obj.get("message") or "LLM provider failure",
+                    "model": ans_obj.get("model"),
+                },
+            )
 
         if not answer:
             if citations:
@@ -3881,7 +3949,7 @@ async def chat_stream(
                     # If server is busy, tell frontend to retry and end stream early
                     if code == "SERVER_BUSY":
                         try:
-                            yield sse_event("error", {"code": "SERVER_BUSY", "message": "SERVER_BUSY", "error": msg, "trace_id": trace_id})
+                            yield sse_event("error", {"code": "SERVER_BUSY", "message": msg or "SERVER_BUSY", "error": msg, "trace_id": trace_id})
                             yield sse_event("done", {"done": True, "thread_id": tid, "trace_id": trace_id})
                         except Exception:
                             return
